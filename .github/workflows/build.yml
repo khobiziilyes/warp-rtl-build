@@ -76,7 +76,7 @@ jobs:
             xcrun metallib --version
             rustc -vV
             cargo --version
-            cargo binstall --version
+            cargo-binstall -V
             cargo bundle --version
             protoc --version
             jq --version
