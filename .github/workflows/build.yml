@@ -1,0 +1,161 @@
+name: Build reviewed Warp RTL
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warp-rtl-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+        working-directory: source
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      LIBCLANG_PATH: /Applications/Xcode_26.3.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib
+      RUSTUP_TOOLCHAIN: "1.92.0"
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_STRIP: symbols
+      CARGO_TARGET_DIR: ${{ github.workspace }}/source/target
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - name: Check out audited public source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: warpdotdev/warp
+          ref: 956994893216670cfb522e5dced2af04667a1c5b
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          submodules: false
+
+      - name: Verify source and prepare minimal build tools
+        run: |
+          test "$(git rev-parse HEAD)" = "956994893216670cfb522e5dced2af04667a1c5b"
+          git diff --exit-code
+          git diff --cached --exit-code
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          test -s "$LIBCLANG_PATH/libclang.dylib"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          test -d "$SDKROOT"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version | grep -Fx 'Xcode 26.3'
+          for tool in jq cmake make pkg-config brew rustup; do
+            command -v "$tool"
+          done
+          if ! command -v protoc; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install protobuf
+          fi
+          unset WARP_LOCAL_SKIP_METAL
+          ./script/macos/install_build_deps
+          test -x "$(xcrun --find metal)"
+          test -x "$(xcrun --find metallib)"
+          rustup toolchain install 1.92.0 --profile minimal
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
+          ./script/install_cargo_bundle
+          {
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun metal --version
+            xcrun metallib --version
+            rustc -vV
+            cargo --version
+            cargo binstall --version
+            cargo bundle --version
+            protoc --version
+            jq --version
+            cmake --version
+            make --version
+            pkg-config --version
+          } | tee "$RUNNER_TEMP/warp-rtl-tools.txt"
+
+      - name: Compile locked native RTL app and bundle without rebuilding
+        run: |
+          unset WARP_LOCAL_SKIP_METAL
+          cargo build --locked -p warp --bin warp-oss --features gui,rtl_terminal_text,release_bundle
+          # cargo-bundle 0.11.0 has no --locked; package only the successful locked build.
+          WARP_BIN_NAME=warp-oss WARP_CHANNEL=oss FEATURES=gui,rtl_terminal_text,release_bundle \
+            CARGO_BUNDLE_SKIP_BUILD=1 ./script/macos/run --dont-open --format osx
+
+      - name: Validate and package with source provenance
+        run: |
+          shopt -s nullglob
+          shaders=("$CARGO_TARGET_DIR"/debug/build/warpui-*/out/shaders.metallib)
+          test "${#shaders[@]}" -gt 0
+          for shader in "${shaders[@]}"; do
+            test -s "$shader"
+          done
+          app="$CARGO_TARGET_DIR/debug/bundle/osx/WarpOss.app"
+          test -d "$app"
+          test -x "$app/Contents/MacOS/warp-oss"
+          test "$(lipo -archs "$app/Contents/MacOS/warp-oss")" = "arm64"
+          plutil -lint "$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "dev.warp.WarpOss"
+          codesign --verify --deep --strict "$app"
+          test "$(git rev-parse HEAD)" = "956994893216670cfb522e5dced2af04667a1c5b"
+          git diff --exit-code
+          git diff --cached --exit-code
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          artifacts="$GITHUB_WORKSPACE/artifacts"
+          mkdir "$artifacts"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$artifacts/WarpOss-arm64.zip"
+          zip_bytes="$(stat -f %z "$artifacts/WarpOss-arm64.zip")"
+          test "$zip_bytes" -gt 0
+          if (( zip_bytes > 450 * 1024 * 1024 )); then
+            echo "ZIP is $zip_bytes bytes; refusing upload above 450 MiB." >&2
+            exit 1
+          fi
+          (
+            cd "$artifacts"
+            shasum -a 256 WarpOss-arm64.zip > SHA256SUMS.txt
+            shasum -a 256 -c SHA256SUMS.txt
+          )
+          {
+            echo '# Warp RTL build provenance'
+            echo
+            echo "Source: $(git remote get-url origin)"
+            echo "Commit: $(git rev-parse HEAD)"
+            echo 'Features: gui,rtl_terminal_text,release_bundle'
+            echo 'Profile: dev; native arm64; locked compilation; clean source.'
+            echo 'Bundle: WarpOss.app; identifier: dev.warp.WarpOss'
+            echo 'Upstream ad-hoc signing verified; not notarized. No launch performed.'
+            echo "ZIP size: $zip_bytes bytes (limit: 450 MiB)."
+            echo 'Verify checksum, signature, architecture and app-data separation before launching.'
+            echo
+            echo '## ZIP checksum'
+            cat "$artifacts/SHA256SUMS.txt"
+            echo
+            echo '## Actual build tools'
+            echo '```text'
+            cat "$RUNNER_TEMP/warp-rtl-tools.txt"
+            echo '```'
+          } > "$artifacts/README.md"
+          cat "$artifacts/README.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload app ZIP, checksum and provenance
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: WarpOss-arm64-956994893216
+          path: |
+            artifacts/WarpOss-arm64.zip
+            artifacts/SHA256SUMS.txt
+            artifacts/README.md
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
